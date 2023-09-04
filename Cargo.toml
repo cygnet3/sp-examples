@@ -1,0 +1,22 @@
+[package]
+name = "sp-wallet"
+version = "0.1.0"
+edition = "2021"
+default-run = "send-receive-example"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# bdk = { path = "../bdk" }
+# bdk = { version = "0.28", features = ["use-esplora-blocking"] }
+bdk = "0.28"
+# bitcoin = "0.30.1"
+silentpayments = { git = "https://github.com/cygnet3/rust-silentpayments", branch = "master" }
+# silentpayments = { path = "../silentpayments" }
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# bip32 = "0.5"
+# nakamoto = "0.4"
+nakamoto = { git = "https://github.com/cloudhead/nakamoto", branch = "master" }
+env_logger = "0.10"
