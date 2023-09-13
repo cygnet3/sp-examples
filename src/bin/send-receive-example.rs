@@ -5,7 +5,7 @@ use bdk::{
         schnorr::{TweakedPublicKey, UntweakedPublicKey},
         secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey},
         util::bip32::{DerivationPath, ExtendedPrivKey},
-        Address, KeyPair, OutPoint, PrivateKey, Txid,
+        Address, KeyPair, OutPoint, PrivateKey, Transaction, Txid, XOnlyPublicKey,
     },
     blockchain::{ElectrumBlockchain, GetTx},
     descriptor::calc_checksum,
@@ -23,9 +23,9 @@ const IS_TESTNET: bool = true;
 
 fn main() {
     // info from transaction to be spent
-    let key_derivation_path = "m/84'/1'/0'/0/2";
-    let txid = "33fb23469ea1add4e0a86407a7bde88f57eeeb48490a92d035211273bb3a3d8c";
-    let vout = 0;
+    let key_derivation_path = "m/84'/1'/0'/0/3";
+    let txid = "28b6bd261af76ac1b089fc10ad6e7d020ae01273ab0fd1a9fccf81c92a61744c";
+    let vout = 1;
 
     // get sender
     let alice = create_sender_keypair(key_derivation_path);
@@ -33,13 +33,12 @@ fn main() {
     // get recipient
     let bob = create_sp_receiver();
 
-    // test sending
-    //input used
+    // print address to send to
     sending_get_address(alice, &bob, txid, vout);
 
     // sender now sends to this taproot address, broadcasts transaction
     // txid for sent transaction:
-    let txid = "41a9fb95b522e50ef9e0d3680d7fe851cf16ae99c37a721e8217307d9b6945ca";
+    let txid = "df141f1c5af033f73eaf63010d85ef9b76f9dff35da61c483ecbe38d93dedd9c";
 
     // test receiving
     receiving_discover_private_key(alice, bob, txid);
@@ -57,26 +56,36 @@ fn sending_get_address(alice: KeyPair, bob: &Receiver, txid: &str, vout: u32) {
         generate_recipient_pubkey(sp_address_to_be_paid, ecdh_shared_secret).unwrap();
 
     // this address can be paid to by the sender
-    let p2tr_address = get_p2tr(output_for_bob);
-    eprintln!("p2tr address = {:?}", p2tr_address);
+    let p2tr_address = get_address(output_for_bob);
+    eprintln!("p2tr address: {:?}", p2tr_address);
 
     let scriptpubkey = p2tr_address.script_pubkey();
-    eprintln!("scriptpubkey in this address = {:?}", scriptpubkey);
+    eprintln!("scriptpubkey in this address: {:?}", scriptpubkey);
 }
 
 fn receiving_discover_private_key(alice: KeyPair, bob: Receiver, txid: &str) {
-    let A_sum = alice.public_key();
-    let outpoints_hash: Scalar = lookup_tx_and_get_outpoints_hash(txid);
+    let tx = lookup_tx(&txid);
 
-    let recipient_tweak_data = calculate_tweak_data_for_recipient(A_sum, outpoints_hash);
+    let A_sum = get_A_sum_from_tx(&tx);
+    assert_eq!(A_sum, alice.public_key());
 
-    let taproot_output = bob
-        .get_taproot_output_from_tweak_data(&recipient_tweak_data, 0)
+    let outpoints_hash = get_outpoints_hash(tx);
+
+    let secp = Secp256k1::new();
+    let tweak_data = A_sum.mul_tweak(&secp, &outpoints_hash).unwrap();
+
+    println!("expected tweak data: {}", tweak_data);
+
+    let script_bytes = bob
+        .get_script_bytes_from_tweak_data(&tweak_data, 0)
         .unwrap();
+    let taproot_output_bytes = &script_bytes[2..];
+
+    let taproot_output = XOnlyPublicKey::from_slice(taproot_output_bytes).unwrap();
 
     // look for outputs that belong to this recipient from a list of outputs (of length 1)
     let keys_found = bob
-        .scan_transaction(&recipient_tweak_data, vec![taproot_output])
+        .scan_transaction(&tweak_data, vec![taproot_output])
         .unwrap();
 
     // 1 key is found
@@ -91,20 +100,14 @@ fn receiving_discover_private_key(alice: KeyPair, bob: Receiver, txid: &str) {
     eprintln!("descriptor: {}#{}", rawtr, checksum);
 }
 
-fn lookup_tx_and_get_outpoints_hash(txid: &str) -> Scalar {
+fn lookup_tx(txid: &str) -> Transaction {
     let client = Client::new("ssl://node202.fra.mempool.space:60602").unwrap();
     let blockchain = ElectrumBlockchain::from(client);
 
     let txid = Txid::from_str(txid).unwrap();
-    let mut tx = blockchain.get_tx(&txid).unwrap().unwrap();
+    let tx = blockchain.get_tx(&txid).unwrap().unwrap();
 
-    TxOrdering::Bip69Lexicographic.sort_tx(&mut tx);
-
-    let outpoints: Vec<OutPoint> = tx.input.into_iter().map(|x| x.previous_output).collect();
-
-    let outpoints_hash = hash_outpoints(&outpoints);
-
-    outpoints_hash
+    tx
 }
 
 #[derive(Deserialize, Debug)]
@@ -157,16 +160,19 @@ fn create_sp_receiver() -> Receiver {
     bob
 }
 
-fn get_p2tr(key: UntweakedPublicKey) -> Address {
+fn get_address(key: UntweakedPublicKey) -> Address {
     let assumetweaked = TweakedPublicKey::dangerous_assume_tweaked(key);
 
     Address::p2tr_tweaked(assumetweaked, bdk::bitcoin::Network::Signet)
     // Address::p2tr(&secp, key, None, bdk::bitcoin::Network::Signet)
 }
 
-fn hash_outpoints(sending_data: &Vec<OutPoint>) -> Scalar {
-    let mut outpoints: Vec<Vec<u8>> = vec![];
+fn get_outpoints_hash(mut tx: Transaction) -> Scalar {
+    TxOrdering::Bip69Lexicographic.sort_tx(&mut tx);
 
+    let sending_data: Vec<OutPoint> = tx.input.into_iter().map(|x| x.previous_output).collect();
+
+    let mut outpoints: Vec<Vec<u8>> = vec![];
     for outpoint in sending_data {
         let txid: [u8; 32] = outpoint.txid.into_inner();
         let vout: u32 = outpoint.vout;
@@ -185,6 +191,28 @@ fn hash_outpoints(sending_data: &Vec<OutPoint>) -> Scalar {
     }
 
     Scalar::from_be_bytes(sha256::Hash::from_engine(engine).into_inner()).unwrap()
+}
+
+fn get_A_sum_from_tx(tx: &Transaction) -> PublicKey {
+    let inputs = &tx.input;
+
+    if inputs.len() != 1 {
+        panic!("Only allow tx with 1 p2wpkh input");
+    }
+
+    let input = inputs[0].clone();
+
+    let is_p2wpkh = input.script_sig.is_empty()
+        && input.witness.len() == 2
+        && PublicKey::from_slice(input.witness.last().unwrap()).is_ok();
+
+    if !is_p2wpkh {
+        panic!("not p2wpkh");
+    }
+
+    let pk = PublicKey::from_slice(input.witness.last().unwrap()).unwrap();
+
+    pk
 }
 
 fn hash_outpoints_used_in_input(txid: &str, vout: u32) -> Scalar {
@@ -213,12 +241,6 @@ fn hash_outpoints_used_in_input(txid: &str, vout: u32) -> Scalar {
     }
 
     Scalar::from_be_bytes(sha256::Hash::from_engine(engine).into_inner()).unwrap()
-}
-
-fn calculate_tweak_data_for_recipient(A_sum: PublicKey, outpoints_hash: Scalar) -> PublicKey {
-    let secp = Secp256k1::new();
-
-    A_sum.mul_tweak(&secp, &outpoints_hash).unwrap()
 }
 
 fn sender_calculate_shared_secret(
